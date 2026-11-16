@@ -1,0 +1,14 @@
+# Proprietary Realtek/TP-Link firmware - never commit this.
+*.dat
+*.sys
+*.cat
+*.inf
+
+# Agent state / logs
+.autopatch-state
+*.log
+
+# macOS / Python noise
+.DS_Store
+__pycache__/
+*.py[cod]
