@@ -1,4 +1,6 @@
-# rtl8761b-fwload
+# blueboot
+
+*Realtek RTL8761B Bluetooth firmware loader for macOS.*
 
 Make a Realtek **RTL8761B** USB Bluetooth adapter (TP-Link UB500 and friends) actually work
 inside a **Windows 11 ARM64** VM — by loading the controller's firmware from the macOS host,
