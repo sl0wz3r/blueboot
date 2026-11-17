@@ -43,6 +43,18 @@ guest issues when it attaches.
 No Windows driver. No Secure Boot change, no test signing, no WDAC exemption — which matters
 if the guest is a managed corporate machine where none of those are available to you.
 
+## Where this applies
+
+The upload happens on the **macOS side**, over USB, before the dongle is handed to anything — so
+the hypervisor is not part of the fix. Parallels Desktop, VMware Fusion, UTM and VirtualBox all
+behave the same once the controller is already patched; only the macOS host matters.
+
+That is also the limit: **this needs a Mac.** On bare-metal Windows on ARM — a Snapdragon X Elite
+laptop, a Surface Pro 11, a ThinkPad X13s — there is no host to run it from, and the patch lives
+in volatile controller RAM, so patching the dongle on a Mac and carrying it across does not
+survive the unplug. Everything under *The problem* above still explains those machines; this tool
+cannot fix them. [Swap the adapter](#if-the-patch-does-not-survive-the-handoff) instead.
+
 ## Is this your problem?
 
 Check the radio's firmware id. `lmp_subver = 0x8761` with `hci_rev = 0x000B` is the RTL8761B
@@ -67,6 +79,19 @@ Rule out the boring causes first — stopped services, airplane mode, a soft-blo
 
 An inquiry that completes cleanly (`ERROR_NO_MORE_ITEMS`) yet finds nothing, with a
 discoverable device sitting next to it, is the signature.
+
+### The same fingerprint on Linux
+
+If you arrived from a kernel log rather than Device Manager, this is the same bug. `btrtl` prints
+the identifiers lowercase and without the `0x`, through
+`examining hci_ver=%02x hci_rev=%04x lmp_ver=%02x lmp_subver=%04x` — a stock RTL8761BU on USB
+matches `hci_ver=0a`, `hci_rev=000b`, `lmp_subver=8761`. Linux then uploads
+`rtl_bt/rtl8761bu_fw.bin`. On Windows ARM64 nothing does.
+
+One naming trap: there is no `RTL_ROM_LMP_8761B` constant in `btrtl.c`. The B and BU parts reuse
+the 8761**A**'s subver — `#define RTL_ROM_LMP_8761A 0x8761` — and are separated by revision and
+bus, with `IC_INFO(RTL_ROM_LMP_8761A, 0xb, 0xa, HCI_USB)` being the 8761BU row
+(`lmps, hcir, hciv, bus`). Inside the patch container the part is identified by `project_id 14`.
 
 ## Getting the firmware
 
@@ -214,6 +239,11 @@ come up normally, and the attach succeeds.
 Verified against `drivers/bluetooth/btrtl.c` and `btrtl.h` (Linux master), and against a real
 device.
 
+The pattern is not new. [BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM) does the same
+job for Broadcom BCM20702/BCM20703 controllers — upload the vendor firmware from the host, because
+whatever normally does it is missing. This is that idea applied to Realtek's RTL87xx ROM-patch
+protocol, with macOS as the host rather than the target.
+
 ```
 HCI transport : USB control transfer, bmRequestType 0x20 (class, device),
                 bRequest 0, wValue 0, wIndex 0, payload = HCI command packet.
@@ -236,10 +266,27 @@ no-op config that Linux appends, if you want to match that path exactly.
 
 ## Corroboration
 
-* **A2DP-Windows-Bridge issue #66** — "LMP subversion 0x8761 is the ROM code… finds nothing
-  in a scan", which started working the moment valid firmware was uploaded.
-* Reports of Realtek dongles on Windows 11 ARM64 binding `bth.inf_arm64` / `BTHUSB`, showing
-  "working properly" with `ProblemCode 0`, and discovering nothing.
+Independent reports of this exact fingerprint, none of which arrive at the firmware explanation:
+
+* [BlueCaster issue #66](https://github.com/SeiyaFunaokaJP/BlueCaster/issues/66) — the project
+  was called **A2DP-Windows-Bridge** when this was filed. "LMP subversion 0x8761 is the ROM
+  code… finds nothing in a scan", which started working the moment valid firmware was uploaded.
+  The closest published statement of the root cause.
+* [Parallels forum — "Bluetooth USB adapter recognised in Windows 11 ARM but cannot discover any
+  devices"](https://forum.parallels.com/threads/bluetooth-usb-adapter-recognised-in-windows-11-arm-but-cannot-discover-any-devices-parallels-desktop-27-m4-mac.370824/)
+  — the whole fingerprint, reported independently: "Generic Bluetooth Adapter", "This device is
+  working properly", `bth.inf_arm64` / `BTHUSB`, PowerShell `ProblemCode = 0`, and a scan that
+  finds nothing. Unanswered.
+* [Parallels forum — "USB Bluetooth Adapter: macOS and Parallels 26, Windows 11
+  ARM"](https://forum.parallels.com/threads/usb-bluetooth-adapter-macos-and-parallels-26-windows-11-arm.369311/)
+  — three users, no resolution.
+* [VMware Fusion on an M4 Pro MacBook
+  Pro](https://community.broadcom.com/vmware-cloud-foundation/discussion/bluetooth-on-m4pro-macbook-pro-with-fusion-and-windows11-arm64)
+  — the same failure under a different hypervisor, and the most useful data point of the lot: the
+  same dongle **works in a Linux ARM64 guest on that host**. That is `btrtl` uploading the patch
+  in the Linux guest, and nothing uploading it in the Windows guest.
+* [UTM issue #4995](https://github.com/utmapp/UTM/issues/4995) — UTM has no Bluetooth passthrough
+  at all, so a USB dongle is the only route there.
 
 ## If the patch does not survive the handoff
 
