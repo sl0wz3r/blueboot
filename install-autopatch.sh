@@ -12,10 +12,10 @@
 
 set -euo pipefail
 
-LABEL="com.ub500.autopatch"
-APPSUP="$HOME/Library/Application Support/ub500-autopatch"
+LABEL="com.blueboot.autopatch"
+APPSUP="$HOME/Library/Application Support/blueboot"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG="$HOME/Library/Logs/ub500-autopatch.log"
+LOG="$HOME/Library/Logs/blueboot.log"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTERVAL="${UB500_INTERVAL:-10}"
 

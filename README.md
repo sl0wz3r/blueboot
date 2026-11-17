@@ -142,7 +142,7 @@ again. The agent re-applies it automatically:
 ```
 
 A LaunchAgent runs `--auto` every 10 seconds. It installs a **copy** of the tool and firmware
-into `~/Library/Application Support/ub500-autopatch/` rather than running them from
+into `~/Library/Application Support/blueboot/` rather than running them from
 `~/Downloads`: that folder, along with `~/Desktop` and `~/Documents`, is TCC-protected, and a
 background LaunchAgent reading from it can be denied with no visible error.
 
@@ -164,8 +164,8 @@ That last row is the point. Without it a denied USB-access prompt looks exactly 
 so a 10-second timer does not produce a heartbeat log.
 
 ```bash
-tail -f ~/Library/Logs/ub500-autopatch.log
-launchctl print gui/$UID/com.ub500.autopatch | grep -E "state =|runs =|last exit"
+tail -f ~/Library/Logs/blueboot.log
+launchctl print gui/$UID/com.blueboot.autopatch | grep -E "state =|runs =|last exit"
 ```
 
 ### Timing

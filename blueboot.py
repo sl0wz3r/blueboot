@@ -406,7 +406,7 @@ def default_dat():
         return env
     here = os.path.dirname(os.path.abspath(__file__))
     for c in (
-        os.path.expanduser("~/Library/Application Support/ub500-autopatch/rtl8761b_rom_patch.dat"),
+        os.path.expanduser("~/Library/Application Support/blueboot/rtl8761b_rom_patch.dat"),
         os.path.join(here, FW_BASENAME),
         os.path.join(here, "rtl8761b_rom_patch.dat"),
         os.path.join(os.getcwd(), FW_BASENAME),
