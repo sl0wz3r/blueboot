@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rtl8761b-fwload.py - host-side Realtek RTL8761B/BU Bluetooth ROM-patch loader for macOS.
+blueboot.py - host-side Realtek RTL8761B/BU Bluetooth ROM-patch loader for macOS.
 
 WHY THIS EXISTS
 ---------------

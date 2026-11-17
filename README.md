@@ -91,9 +91,9 @@ Requires `brew install libusb`.
 ```bash
 # 1. Release the dongle from the VM  (Parallels: Devices > USB & Bluetooth > your adapter)
 
-python3 rtl8761b-fwload.py --info          # read-only: what firmware is it running?
-python3 rtl8761b-fwload.py                 # upload the patch
-python3 rtl8761b-fwload.py --test-reset    # does the patch survive a USB port reset?
+python3 blueboot.py --info          # read-only: what firmware is it running?
+python3 blueboot.py                 # upload the patch
+python3 blueboot.py --test-reset    # does the patch survive a USB port reset?
 
 # 2. Reattach to the VM WITHOUT unplugging
 ```
@@ -256,7 +256,7 @@ against the patch survives it (`--test-reset` verifies this directly). If yours 
 ## Files
 
 ```
-rtl8761b-fwload.py        the loader (--info / --auto / --test-reset / --append-config)
+blueboot.py               the loader (--info / --auto / --test-reset / --append-config)
 install-autopatch.sh      LaunchAgent install / uninstall
 tests/test_auto_mode.py   branch coverage for --auto, no hardware needed
 diagnostics/

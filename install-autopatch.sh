@@ -58,7 +58,7 @@ error: Realtek ROM patch not found.
 MSG
   exit 1
 fi
-if [[ ! -f "$SRC_DIR/rtl8761b-fwload.py" ]]; then echo "error: rtl8761b-fwload.py missing" >&2; exit 1; fi
+if [[ ! -f "$SRC_DIR/blueboot.py" ]]; then echo "error: blueboot.py missing" >&2; exit 1; fi
 
 # sanity: the interpreter must actually be able to reach libusb
 if ! "$PYBIN" - <<'PY' >/dev/null 2>&1
@@ -76,9 +76,9 @@ fi
 # --- install -----------------------------------------------------------------
 echo "Installing $LABEL"
 mkdir -p "$APPSUP" "$(dirname "$PLIST")" "$(dirname "$LOG")"
-install -m 0755 "$SRC_DIR/rtl8761b-fwload.py" "$APPSUP/rtl8761b-fwload.py"
+install -m 0755 "$SRC_DIR/blueboot.py" "$APPSUP/blueboot.py"
 install -m 0644 "$DAT"                        "$APPSUP/rtl8761b_rom_patch.dat"
-echo "  tool     -> $APPSUP/rtl8761b-fwload.py"
+echo "  tool     -> $APPSUP/blueboot.py"
 echo "  firmware -> $APPSUP/rtl8761b_rom_patch.dat"
 
 cat > "$PLIST" <<PLISTEOF
@@ -91,7 +91,7 @@ cat > "$PLIST" <<PLISTEOF
     <key>ProgramArguments</key>
     <array>
         <string>$PYBIN</string>
-        <string>$APPSUP/rtl8761b-fwload.py</string>
+        <string>$APPSUP/blueboot.py</string>
         <string>--auto</string>
         <string>--dat</string>
         <string>$APPSUP/rtl8761b_rom_patch.dat</string>

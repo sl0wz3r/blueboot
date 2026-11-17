@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for rtl8761b-fwload.py --auto decision logic.
+"""Tests for blueboot.py --auto decision logic.
 
 The USB layer underneath is already proven: the real patch upload succeeded against
 the actual dongle. What was untested is the *unattended* decision logic added for the
@@ -21,7 +21,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOL = os.path.normpath(os.path.join(HERE, "..", "rtl8761b-fwload.py"))
+TOOL = os.path.normpath(os.path.join(HERE, "..", "blueboot.py"))
 spec = importlib.util.spec_from_file_location("fwload", TOOL)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
