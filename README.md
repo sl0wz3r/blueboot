@@ -78,7 +78,11 @@ Rule out the boring causes first — stopped services, airplane mode, a soft-blo
 ```
 
 An inquiry that completes cleanly (`ERROR_NO_MORE_ITEMS`) yet finds nothing, with a
-discoverable device sitting next to it, is the signature.
+discoverable device sitting next to it, is the signature — *provided the adapter is actually
+present*. `Radio-Props.ps1` reads the PnP property store, which keeps serving values after a
+device stops being present, so a stale node can report a patched radio that is not there. If
+your controller already reads `0xC761` and Bluetooth still does not work, skip to
+[Patched, and still not working](#patched-and-still-not-working).
 
 ### The same fingerprint on Linux
 
@@ -102,9 +106,11 @@ redistributing it is not mine to do. You already have it if you own the adapter:
 2. Extract it and find `Driver/Windows_11_64bit/rtl8761b_mp_chip_bt40_fw_asic_rom_patch_new.dat`.
 3. Pass it with `--dat`, or set `UB500_FW=/path/to/that.dat`.
 
-The tool validates it: `Realtech` container signature, a `project_id` in the trailing
-extension block matching your chip, and a patch whose `chip_id` matches the controller's ROM
-version. Mismatches are refused rather than uploaded.
+The tool checks the `Realtech` container signature, rejects the unrelated `RTBTCore`
+format, and selects the patch whose `chip_id` matches the controller's ROM version — a
+container with no matching patch is refused rather than uploaded. It also reads the
+`project_id` from the trailing extension block and prints it (`14` = 8761B) for you to eyeball;
+it does not currently refuse on that alone.
 
 Linux users: `linux-firmware` ships `rtl_bt/rtl8761bu_fw.bin`, a different (older) build of
 the same thing. Either works; they are not byte-identical.
@@ -116,6 +122,7 @@ Requires `brew install libusb`.
 ```bash
 # 1. Release the dongle from the VM  (Parallels: Devices > USB & Bluetooth > your adapter)
 
+python3 blueboot.py --status        # will Bluetooth work right now? (never opens the device)
 python3 blueboot.py --info          # read-only: what firmware is it running?
 python3 blueboot.py                 # upload the patch
 python3 blueboot.py --test-reset    # does the patch survive a USB port reset?
@@ -159,7 +166,11 @@ the same operation Linux performs on every boot.
 ## Keeping it patched
 
 RAM patch + power cycle = gone, and when it is gone Bluetooth silently stops finding things
-again. The agent re-applies it automatically:
+again. Unplugging the dongle does it, and so does **rebooting or shutting down the Mac** — the
+dongle loses bus power with the host. That second case is the one that bites, because your VM
+may come back from suspend believing nothing happened; see
+[Patched, and still not working](#patched-and-still-not-working). The agent re-applies the patch
+automatically:
 
 ```bash
 ./install-autopatch.sh /path/to/rtl8761b_mp_chip_bt40_fw_asic_rom_patch_new.dat
@@ -174,19 +185,42 @@ background LaunchAgent reading from it can be denied with no visible error.
 ### How it decides what to do
 
 `--auto` asks `ioreg` first, because `ioreg` still reports a device a VM holds exclusively
-while libusb does not. That gives a real three-way answer instead of one ambiguous failure:
+while libusb does not. That gives a real four-way answer instead of one ambiguous failure:
 
 | situation | action |
 |---|---|
+| `ioreg` did not answer | **log once** — a probe that saw nothing is *not* evidence the dongle is free |
 | not plugged in | silent, exit 0 |
-| plugged in, owned by a VM | silent, exit 0 — never competes with the hypervisor |
+| owned by a VM, same enumeration we patched | silent, exit 0 — never competes with the hypervisor |
+| owned by a VM, **a new enumeration** | **log a warning** — the guest has an unpatched controller |
 | free, already patched | silent, exit 0 |
 | free, running stock ROM | **patch it**, log one line |
-| free but libusb cannot open it | **log a warning** — macOS likely denied USB access |
+| free but libusb cannot open it | **log a warning**, quoting the real libusb error |
 
-That last row is the point. Without it a denied USB-access prompt looks exactly like
-"everything is fine", and the agent fails silently forever. It logs only on state *changes*,
-so a 10-second timer does not produce a heartbeat log.
+Those warning rows are the point. A fault that looks like "everything is fine" is worse than a
+loud failure, because nobody goes looking. It logs only on state *changes*, so a 10-second timer
+does not produce a heartbeat log; `--status` and a `.heartbeat` file answer "is the agent alive"
+instead, so an empty log means nothing went wrong rather than nothing ran.
+
+### How it knows the VM's dongle is still patched
+
+`ioreg` exposes a **`sessionID`** on the USB device node: a `mach_absolute_time` stamp taken when
+the device enumerated. Two properties make it the keystone of the whole design. It stays readable
+while the hypervisor holds the device exclusively — exactly the window in which libusb can tell
+you nothing — and it changes precisely when the dongle re-enumerates, which is precisely when the
+RAM patch is lost.
+
+So the agent records the session it patched, and compares. "The VM has it" stops being a shrug
+and becomes a claim you can falsify:
+
+```
+2026-11-18 08:36:05  PATCHED ok -> 0xDDD5C761 (29124 bytes, rom_version 1)
+2026-11-18 08:51:46  dongle re-enumerated (session 4986975767 -> 59093045483) while held by
+                     pid 5968, prl_vm_app - the guest now has an UNPATCHED controller.
+```
+
+Without that line the agent does the right thing, says nothing, and leaves you to discover by
+hand that the adapter your guest is holding is not the one that got patched.
 
 ```bash
 tail -f ~/Library/Logs/blueboot.log
@@ -199,16 +233,99 @@ If your hypervisor is set to auto-connect the dongle, it will grab it before the
 patch it. Leave it on "ask", and **let the dongle sit on macOS for a few seconds before
 connecting it to the VM**. The log line is your confirmation.
 
+## Patched, and still not working
+
+Everything above assumes the dongle reaching the guest is the dongle you patched. Sometimes it
+is not — and the result looks *identical* to the stock-ROM problem this tool exists to solve,
+which is exactly why it earns its own section. If you re-patch a controller that already reads
+`0xC761`, you will do it forever and nothing will change.
+
+The recipe: reboot the Mac while the VM is running. Your hypervisor **suspends** the guest
+rather than shutting it down, then resumes it. The dongle meanwhile lost bus power, so its RAM
+patch is gone and the agent correctly re-applies it within seconds. But the resumed guest is
+driving a virtual USB controller restored from an image written *before* the host rebooted. The
+dongle gets handed to a virtual port that cannot complete a USB port reset, and you are left
+with two device nodes, neither usable:
+
+- a **phantom** `USB\VID_2357&PID_0604\…` node serving device properties out of cache. It will
+  cheerfully report `Status OK`, the radio `On`, and a patched `LMP subversion` — all of it days
+  stale, none of it in contact with hardware.
+- an **`USB\RESET_FAILURE`** node (`ProblemCode 43`, `CM_PROB_FAILED_POST_START`), shown as
+  *Unknown USB Device (Port Reset Failed)*, squatting on the port the real device arrived on.
+  It carries no VID/PID, because enumeration died before Windows could read the descriptor.
+
+### Telling it apart
+
+Ask about **presence**, not properties. The property store keeps answering long after a device
+stops being present, so anything reading it will confirm a healthy adapter that is not there.
+
+```powershell
+# 1. Actually present, or only remembered?
+Get-PnpDevice -InstanceId 'USB\VID_2357&PID_0604\<serial>' -PresentOnly
+
+# 2. When did Windows last enumerate it? A stale date means it never re-arrived.
+(Get-PnpDeviceProperty -InstanceId 'USB\VID_2357&PID_0604\<serial>' |
+  Where-Object KeyName -eq 'DEVPKEY_Device_LastArrivalDate').Data
+
+# 3. The blunt one. This contradicts a "healthy" device node outright.
+pnputil /restart-device "USB\VID_2357&PID_0604\<serial>"
+#   -> "The device is not connected."   (error 1167)
+
+# 4. Is a reset-failure node squatting on the port?
+Get-PnpDevice -PresentOnly | Where-Object Status -ne 'OK'
+```
+
+A live radio answers this, and it needs no message pump:
+
+```powershell
+[Windows.Devices.Bluetooth.BluetoothAdapter,Windows.Devices.Bluetooth,ContentType=WindowsRuntime] | Out-Null
+# GetDefaultAsync() returns the real BD_ADDR, read off the controller.
+```
+
+**Do not** use `DeviceInformation.FindAllAsync` with an `AssociationEndpoint` selector as a health
+check. It hangs in a console host whether the radio is healthy or dead, so it manufactures exactly
+the false negative this section exists to kill.
+
+From the Mac, one command answers the whole question:
+
+```bash
+python3 blueboot.py --status
+```
+
+### What does not fix it
+
+| attempt | why it fails |
+|---|---|
+| Detach/reattach in the hypervisor menu | Moves the host-side claim only. The guest never sees a disconnect, so nothing re-enumerates and `LastArrivalDate` does not move. |
+| `pnputil /restart-device` | The device is not connected. There is nothing to restart. |
+| `pnputil /remove-device` + `/scan-devices` | The nodes do rebuild — onto the same wedged virtual port. Scope it to one instance id: a class-wide or wildcard removal takes out every other device on that controller, security keys included. |
+| Re-running the patch | The firmware was never the problem. |
+
+### What does fix it
+
+**Shut the guest fully down and start it again.** Not a suspend, and not closing the window if
+your hypervisor is set to suspend on close. That rebuilds the virtual USB controller, which is
+the only thing that was ever broken.
+
+Patch the dongle while the VM is off, then attach it once the guest has reached the desktop.
+Attaching mid-boot re-opens the race between hypervisor passthrough and Windows enumeration,
+which is how the wedged port happens in the first place.
+
 ## Tests
 
 ```bash
 python3 tests/test_auto_mode.py
 ```
 
-18 assertions covering every branch of the unattended logic against a fake controller — no
+43 assertions covering every branch of the unattended logic against a fake controller — no
 USB hardware touched. Beyond return codes it asserts that the bytes the patch branch would
-put on the wire reassemble to exactly the correct patch image: 116 fragments, end marker set,
-none over 252 bytes, `HCI_Reset` first.
+put on the wire reassemble to exactly the correct patch image: fragment count derived from the
+image size, end marker set, none over 252 bytes, `HCI_Reset` first. It also asserts the state
+file contents, including the session-change edge that warns a VM is holding an unpatched
+controller.
+
+Without the firmware blob the suite exits **77**, not 0 — a skip that reports success is how a
+test suite comes to advertise coverage it is not providing.
 
 **What is not covered:** the physical event — unplug, replug, agent patches it unattended.
 That needs a real power cycle to produce a stock-ROM device. The USB layer itself is proven

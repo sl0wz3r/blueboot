@@ -50,6 +50,7 @@ import ctypes
 import ctypes.util
 import datetime
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -416,89 +417,217 @@ def default_dat():
     return os.path.join(here, FW_BASENAME)
 
 
+STOCK_SIG = (0x000B, 0x8761)      # hci_rev, lmp_subver of unpatched RTL8761B ROM
+
+
+def _ioreg(argv, timeout=5):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout).stdout
+
+
 def probe_bus(vid, pid):
     """Ask ioreg about the dongle. Unlike libusb, ioreg still reports a device that
-    Parallels holds exclusively, so this gives a true three-way answer:
+    Parallels holds exclusively, so this gives a true FOUR-way answer:
 
-        (False, None)      not plugged in
-        (True,  "pid ...") plugged in, owned by another process (normally the VM)
-        (True,  None)      plugged in and free - we may claim it
+        (None,  None,      None)   ioreg did not answer - we know NOTHING
+        (False, None,      None)   not plugged in
+        (True,  "pid ...", S)      plugged in, owned by another process (the VM)
+        (True,  None,      S)      plugged in and free - we may claim it
 
-    That third case matters: if libusb then fails to open a free device, the cause
-    is almost certainly a denied macOS USB-access prompt, which would otherwise be
-    an entirely silent failure in an unattended agent.
+    The first case has to stay distinct from the rest. A probe that observed nothing
+    is not evidence that the dongle is free, and conflating the two is how an agent
+    ends up asserting a cause it never established.
+
+    S is ioreg's sessionID: a mach_absolute_time stamp taken when the device
+    enumerated. Two properties make it the keystone of this tool's self-knowledge.
+    It stays readable while Parallels holds the device exclusively - so it works
+    during exactly the window when libusb cannot tell us anything - and it changes
+    precisely when the dongle re-enumerates, which is precisely when the RAM-resident
+    patch is lost. That turns "the VM has it" from a shrug into a falsifiable claim,
+    and it is the only host-visible signal separating a healthy VM-owned dongle from
+    one the guest is seeing as stock ROM.
+
+    We query the IOUSB plane: ~26 KB rather than ~2 MB, and it yields only the device
+    node. The IOService plane also returns the interface children, which carry
+    UsbExclusiveOwner but no sessionID, so a first-match scan there is ambiguous.
     """
     try:
-        out = subprocess.run(
-            ["/usr/sbin/ioreg", "-r", "-c", "IOUSBHostDevice", "-l", "-w", "0"],
-            capture_output=True, text=True, timeout=15).stdout
-    except Exception:
-        return (None, None)
+        out = _ioreg(["/usr/sbin/ioreg", "-p", "IOUSB", "-r", "-c",
+                      "IOUSBHostDevice", "-l", "-w", "0"])
+        if "+-o " not in out:          # plane unsupported here - fall back
+            out = _ioreg(["/usr/sbin/ioreg", "-r", "-c",
+                          "IOUSBHostDevice", "-l", "-w", "0"], timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return (None, None, None)
 
     for chunk in out.split("+-o ")[1:]:
         if ('"idVendor" = %d' % vid) in chunk and ('"idProduct" = %d' % pid) in chunk:
+            m = re.search(r'"sessionID"\s*=\s*(\d+)', chunk)
+            session = m.group(1) if m else None
             for line in chunk.splitlines():
                 if "UsbExclusiveOwner" in line:
-                    owner = line.split("=", 1)[1].strip().strip('"')
-                    return (True, owner)
-            return (True, None)
-    return (False, None)
+                    return (True, line.split("=", 1)[1].strip().strip('"'), session)
+            return (True, None, session)
+    return (False, None, None)
+
+
+def _state_path(dat):
+    return os.path.join(os.path.dirname(os.path.abspath(dat)), ".autopatch-state")
+
+
+def _read_state(state_path):
+    """Return (word, session, signature).
+
+    Tolerates anything on disk. This file is read by a job that runs every ten
+    seconds forever; a truncated or non-UTF-8 file - entirely possible after the
+    unclean shutdown that a host reboot looks like - must never be able to kill it.
+    """
+    try:
+        with open(state_path, encoding="utf-8", errors="replace") as fh:
+            raw = fh.read().strip()
+    except Exception:
+        return ("", None, None)
+    parts = raw.split(":")
+    word = parts[0] if parts else ""
+    session = parts[1] if len(parts) > 1 and parts[1] else None
+    sig = None
+    if len(parts) > 3:
+        try:
+            sig = (int(parts[2], 16), int(parts[3], 16))
+        except ValueError:
+            sig = None
+    return (word, session, sig)
+
+
+def _write_state(state_path, word, session=None, sig=None):
+    raw = word
+    if session or sig:
+        raw += ":" + (session or "")
+    if sig:
+        raw += ":%04X:%04X" % sig
+    try:
+        tmp = state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(raw)
+        os.replace(tmp, state_path)     # atomic: never leave a half-written state
+    except Exception:
+        pass
 
 
 def auto_mode(args):
     """Unattended mode for the LaunchAgent.
 
-    Stays completely silent unless it actually does something, so the log is a
-    record of real events rather than a heartbeat. Every 'nothing to do' case -
-    dongle unplugged, dongle currently owned by the VM, already patched - exits 0
-    without output. It never competes with Parallels: if the VM holds the device,
-    libusb simply cannot open it and we leave it alone.
+    Stays silent unless something real happened, so the log is a record of events
+    rather than a heartbeat. Liveness is answered by the .heartbeat file and by
+    --status instead, which means an empty log genuinely reads "nothing went wrong"
+    rather than "the agent died three days ago".
+
+    Every exit routes through transition(). That is not tidiness: when a fault path
+    merely printed and returned, the next poll re-read the device, found it "not
+    stock", wrote 'patched' and went silent about a real failure forever.
     """
     def stamp():
         return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Log only on state CHANGES, so a 10-second timer does not fill the log with
-    # heartbeat lines while still surfacing anything that actually needs attention.
-    state_path = os.path.join(os.path.dirname(os.path.abspath(args.dat)), ".autopatch-state")
+    state_path = _state_path(args.dat)
 
-    def transition(state, message=None):
-        try:
-            previous = open(state_path).read().strip()
-        except OSError:
-            previous = ""
-        if state != previous:
-            try:
-                open(state_path, "w").write(state)
-            except OSError:
-                pass
+    # Liveness gets its own file, touched every run. The state file is written only
+    # on CHANGE, so its mtime answers "when did the world last change" and never
+    # "is this agent still alive" - and conflating those is how a dead agent goes on
+    # looking healthy.
+    try:
+        with open(os.path.join(os.path.dirname(state_path), ".heartbeat"),
+                  "w", encoding="utf-8") as fh:
+            fh.write(stamp())
+    except Exception:
+        pass
+
+    def transition(state, message=None, session=None, sig=None):
+        prev_word, prev_session, prev_sig = _read_state(state_path)
+        if state != prev_word or session != prev_session or sig != prev_sig:
+            _write_state(state_path, state, session, sig)
             if message:
                 print("%s  %s" % (stamp(), message))
         return state
 
-    present, owner = probe_bus(args.vid, args.pid)
+    present, owner, session = probe_bus(args.vid, args.pid)
+
+    if present is None:
+        # ioreg told us nothing at all. That is NOT evidence the dongle is free.
+        # This branch used to be absent, so (None, None) fell past both guards and
+        # reached open(), letting a probe that observed nothing report a denied
+        # macOS USB prompt as a confident root cause.
+        transition("probe-failed",
+                   "ioreg did not answer - cannot tell whether the dongle is free")
+        return 0
+
     if present is False:
         transition("absent")
         return 0
+
     if owner:
-        transition("owned")          # the VM has it - expected, nothing to do
+        prev_word, prev_session, prev_sig = _read_state(state_path)
+        if (session and prev_session and session != prev_session
+                and prev_word in ("patched", "owned")):
+            # The device re-enumerated, so the RAM patch is gone - and the VM already
+            # holds the new enumeration, so we cannot reach it to re-patch. The guest
+            # is looking at stock ROM and will find nothing, however healthy its
+            # device node looks. This is the single line that was missing on the
+            # morning this tool cost someone four hours.
+            _write_state(state_path, "owned", session)
+            print("%s  dongle re-enumerated (session %s -> %s) while held by %s - the "
+                  "guest now has an UNPATCHED controller. Shut the VM down fully and "
+                  "start it again; a detach/reattach will not re-enumerate it."
+                  % (stamp(), prev_session, session, owner))
+        else:
+            # Carry the signature forward. "The VM has it" is only good news when we
+            # know this enumeration is the one we patched, so the proof has to
+            # survive the handoff - otherwise --status has to answer UNKNOWN.
+            keep = prev_sig if (prev_session and session == prev_session) else None
+            transition("owned", session=session, sig=keep)
         return 0
 
     try:
         dev = Dongle(args.vid, args.pid).open()
     except HciError as e:
-        # Free on the bus yet unopenable: this is the silent-failure case worth
-        # shouting about, because it usually means macOS denied USB access.
-        transition("blocked",
-                   "dongle is free on the USB bus but cannot be opened - macOS has "
-                   "probably not granted USB access to this agent (%s)" % e.__class__.__name__)
+        # Look again before blaming anything. By far the likeliest explanation is
+        # that Parallels claimed the dongle between our probe and our open, which is
+        # a non-event - not the denied USB prompt this used to assert on no evidence.
+        _, again_owner, again_session = probe_bus(args.vid, args.pid)
+        if again_owner:
+            transition("owned", session=again_session)
+            return 0
+        detail = " ".join(str(e).split())
+        if len(detail) > 220:
+            detail = detail[:217] + "..."
+        # A failed claim_interface and a device that will not open at all have
+        # opposite fixes, so they get distinct state words and cannot mask each
+        # other through transition()'s change detection.
+        word = "blocked-busy" if "claim_interface" in detail else "blocked-access"
+        transition(word,
+                   "dongle is free on the USB bus but cannot be opened: %s" % detail,
+                   session=session)
         return 1
 
     try:
         v = dev.read_local_version()
-        if not (v["lmp_subver"] == 0x8761 and v["hci_rev"] == 0x000B):
-            transition("patched")
+        sig = (v["hci_rev"], v["lmp_subver"])
+        _, _, prev_sig = _read_state(state_path)
+
+        if sig != STOCK_SIG:
+            if prev_sig and sig != prev_sig:
+                # A controller has three possible states, not two. "Not stock" was
+                # being recorded as success, so a half-finished download looked
+                # exactly like a good one.
+                transition("anomalous",
+                           "controller reports 0x%04X%04X - neither stock nor the "
+                           "0x%04X%04X last loaded; firmware state unknown"
+                           % (sig[0], sig[1], prev_sig[0], prev_sig[1]),
+                           session=session, sig=sig)
+                return 3
+            transition("patched", session=session, sig=sig)
             return 0
-        print("%s  stock ROM detected (0x%04X%04X)" % (stamp(), v["hci_rev"], v["lmp_subver"]))
+
+        print("%s  stock ROM detected (0x%04X%04X)" % (stamp(), sig[0], sig[1]))
 
         try:
             dev.reset()
@@ -507,8 +636,14 @@ def auto_mode(args):
         rom = dev.read_rom_version()
 
         if not os.path.exists(args.dat):
-            print("%s  ERROR firmware file missing: %s" % (stamp(), args.dat))
+            # Routed through transition() like every other fault. This is the one
+            # failure guaranteed to recur on every single poll, so it was the one
+            # most in need of the dedup it used to bypass - roughly 12,000 identical
+            # lines a day otherwise.
+            transition("fw-missing", "ERROR firmware file missing: %s" % args.dat,
+                       session=session)
             return 1
+
         blob = open(args.dat, "rb").read()
         img, fw_version, _ = parse_epatch(blob, rom)
         if args.append_config:
@@ -519,15 +654,21 @@ def auto_mode(args):
         exp = ((fw_version >> 16) & 0xFFFF, fw_version & 0xFFFF)
         got = (after["hci_rev"], after["lmp_subver"])
         if got == exp:
-            transition("patched")
+            transition("patched", session=session, sig=got)
             print("%s  PATCHED ok -> 0x%04X%04X (%d bytes, rom_version %d)"
                   % (stamp(), got[0], got[1], len(img), rom))
             return 0
-        print("%s  UNEXPECTED -> 0x%04X%04X, wanted 0x%04X%04X"
-              % (stamp(), got[0], got[1], exp[0], exp[1]))
+        transition("mismatch",
+                   "UNEXPECTED -> 0x%04X%04X, wanted 0x%04X%04X"
+                   % (got[0], got[1], exp[0], exp[1]),
+                   session=session, sig=got)
         return 3
-    except Exception as e:
-        print("%s  ERROR %s" % (stamp(), e))
+    except (Exception, SystemExit) as e:
+        # SystemExit derives from BaseException, so parse_epatch's sys.exit() on a
+        # truncated firmware container used to sail straight past a bare
+        # `except Exception` and out of auto_mode, emitting an untimestamped orphan
+        # line into a log whose one invariant is that every line starts with a date.
+        transition("error", "ERROR %s" % " ".join(str(e).split()), session=session)
         return 1
     finally:
         dev.close()
@@ -564,6 +705,131 @@ def test_reset(args):
     return 0
 
 
+def _decode_session(session):
+    """Decode ioreg's sessionID to wall-clock time.
+
+    It is a mach_absolute_time stamp taken at enumeration, so boot time plus the
+    tick count converted through mach_timebase_info gives the moment the dongle
+    appeared on the bus. Returns None rather than guessing if any part of that is
+    unavailable: a diagnostic that lies is worse than one that abstains.
+    """
+    try:
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"],
+                             capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r"sec\s*=\s*(\d+)", out)
+        if not m:
+            return None
+        boot = int(m.group(1))
+
+        class _Timebase(ctypes.Structure):
+            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+        tb = _Timebase()
+        if ctypes.CDLL(None).mach_timebase_info(ctypes.byref(tb)) != 0 or not tb.denom:
+            return None
+        return datetime.datetime.fromtimestamp(
+            boot + (int(session) * tb.numer / tb.denom) / 1e9)
+    except Exception:
+        return None
+
+
+def status_mode(args):
+    """Answer "is my Bluetooth going to work right now?" in one command.
+
+    Deliberately never opens the device. --info cannot answer this question: it goes
+    through libusb_claim_interface, which fails by design whenever the VM holds the
+    dongle - that is, for the entire duration of the failure you would be debugging.
+    This reads ioreg, ps and our own state files, nothing else.
+
+    Says UNKNOWN rather than guessing. A status command that guesses is the same
+    mistake as a Windows phantom device node cheerfully reporting a healthy adapter
+    out of a stale cache.
+    """
+    state_path = _state_path(args.dat)
+    hb_path = os.path.join(os.path.dirname(state_path), ".heartbeat")
+    word, rec_session, rec_sig = _read_state(state_path)
+    present, owner, session = probe_bus(args.vid, args.pid)
+
+    print("blueboot status")
+    print("=" * 62)
+
+    if present is None:
+        print("dongle        : UNKNOWN - ioreg did not answer")
+    elif present is False:
+        print("dongle        : not plugged in")
+    elif owner:
+        who = owner
+        m = re.search(r"pid\s+(\d+)", owner)
+        if m:
+            try:
+                comm = subprocess.run(["/bin/ps", "-p", m.group(1), "-o", "comm="],
+                                      capture_output=True, text=True,
+                                      timeout=5).stdout.strip()
+                if comm:
+                    who = "%s (pid %s)" % (os.path.basename(comm), m.group(1))
+            except Exception:
+                pass
+        print("dongle        : present, held by %s" % who)
+    else:
+        print("dongle        : present and free on the host")
+
+    if session:
+        when = _decode_session(session)
+        print("enumerated    : %s  (session %s)"
+              % (when.strftime("%Y-%m-%d %H:%M:%S") if when else "unknown time", session))
+
+    if rec_sig and rec_session:
+        print("last patch    : session %s -> 0x%04X%04X"
+              % (rec_session, rec_sig[0], rec_sig[1]))
+    elif word:
+        print("last state    : %s" % word)
+    else:
+        print("last patch    : no record")
+
+    try:
+        age = time.time() - os.path.getmtime(hb_path)
+        print("agent         : %s" % ("alive, last ran %ds ago" % int(age) if age < 120
+                                      else "NO HEARTBEAT - last ran %.1f hours ago"
+                                           % (age / 3600.0)))
+    except OSError:
+        print("agent         : no heartbeat yet - has the LaunchAgent run since install?")
+
+    print("-" * 62)
+
+    if present is None:
+        print("VERDICT: UNKNOWN - could not read the USB bus.")
+        return 2
+    if present is False:
+        print("VERDICT: NO - the dongle is not plugged in.")
+        return 1
+    if not session or not rec_session:
+        print("VERDICT: UNKNOWN - no patch recorded for this enumeration.")
+        return 2
+    if session != rec_session:
+        print("VERDICT: NO - the dongle re-enumerated since it was patched")
+        print("  (patched session %s, now %s), so the RAM patch is GONE."
+              % (rec_session, session))
+        if owner:
+            print("  The VM holds it, so the host cannot re-patch it. Shut the guest")
+            print("  down fully and start it again - detach/reattach will not help,")
+            print("  because it does not re-enumerate the device.")
+        else:
+            print("  It is free on the host; the agent should re-patch within ~10s.")
+        return 1
+    if not rec_sig:
+        print("VERDICT: UNKNOWN - this enumeration is the one on record, but no patch")
+        print("  signature was recorded for it, so we cannot claim it is patched.")
+        print("  Unplug and replug the dongle to let the agent patch it from scratch.")
+        return 2
+    if owner:
+        print("VERDICT: YES - the guest holds the very enumeration we patched.")
+        print("  If Bluetooth still does not work the fault is inside the guest, not")
+        print("  the firmware. See \"Patched, and still not working\" in the README.")
+        return 0
+    print("VERDICT: YES - patched, and still on the host. Attach it to the VM.")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Upload the Realtek RTL8761B ROM patch to a USB Bluetooth dongle from macOS.",
@@ -581,6 +847,8 @@ def main():
                     help="append the 6-byte no-op config blob, as Linux btrtl does (fallback)")
     ap.add_argument("--auto", action="store_true",
                     help="unattended: patch only if present, free and stock; silent otherwise")
+    ap.add_argument("--status", action="store_true",
+                    help="report whether Bluetooth should work right now (never touches the device)")
     ap.add_argument("--test-reset", action="store_true",
                     help="issue a USB port reset and check whether the patch survives it")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -588,6 +856,8 @@ def main():
 
     if args.auto:
         return auto_mode(args)
+    if args.status:
+        return status_mode(args)
 
     print("Realtek RTL8761B ROM-patch loader")
     print("=" * 62)
